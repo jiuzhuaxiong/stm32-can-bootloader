@@ -1,184 +1,44 @@
+//
+// CAN Bootloader
+//
+
 #include "stm32f3xx_hal.h"
+#include "config.h"
 
-#define CAN_SPEED CAN_BITRATE_500K
-
-
-#define WAIT_HOST 0
-#define IDLE      1
-#define PAGE_PROG 2
+#define NUM_OF_PAGES               (NUM_PAGES_TOTAL - MAIN_PROGRAM_PAGE_NUMBER)
+#define MAIN_PROGRAM_START_ADDRESS (uint32_t)0x08000000 + (FLASH_PAGE_SIZE*MAIN_PROGRAM_PAGE_NUMBER) // start of page 3
 
 
-typedef void (*pFunction)(void);
-
-// Flash configuration
-
-// TODO:
-// STM32F302 has:
-//  - 2kbytes flash page size
-//  - 64k flash total
-//  => 32 pages total
-// Try and fit into one page!
-
-#define NUM_PAGES_TOTAL 32U
-
-#define MAIN_PROGRAM_START_ADDRESS              (uint32_t)0x08001800 // start of page 3
-#define MAIN_PROGRAM_PAGE_NUMBER                3U
-#define NUM_OF_PAGES                            (NUM_PAGES_TOTAL - MAIN_PROGRAM_PAGE_NUMBER)
-
-// CAN identifiers
-#define DEVICE_CAN_ID                            0x78E
-#define CMD_HOST_INIT                            0x01
-#define CMD_PAGE_PROG                            0x02
-#define CMD_BOOT                                0x03
-
-#define CAN_RESP_OK                              0x01
-#define CAN_RESP_ERROR                          0x02
-
+// Public variables
 CAN_HandleTypeDef hcan;
-CRC_HandleTypeDef hcrc;
-
-static CanTxMsgTypeDef        canTxMessage;
-static CanRxMsgTypeDef        canRxMessage;
-static FLASH_EraseInitTypeDef eraseInitStruct;
-void micro_memcpy(void *dest, void *src, uint32_t n);
-
 pFunction                     JumpAddress;
 uint8_t                       PageBuffer[FLASH_PAGE_SIZE];
 volatile int                  PageBufferPtr;
 uint8_t                       PageIndex;
 uint32_t                      PageCRC;
-
 volatile uint8_t              blState;
 
 
-static void SystemClock_Config(void);
+// Private variables
+static CanTxMsgTypeDef        canTxMessage;
+static CanRxMsgTypeDef        canRxMessage;
+static FLASH_EraseInitTypeDef eraseInitStruct;
+static CRC_HandleTypeDef hcrc;
+
+
+// Private methods
+static void __clock_init(void);
 static void __crc_init(void);
 static void __can_init(void);
+static void __micro_memcpy(void *dest, void *src, uint32_t n);
+static void __jump_to_application();
+static void __respond(uint8_t response);
 
-
-void JumpToApplication()
-{
-  JumpAddress = *(__IO pFunction*)(MAIN_PROGRAM_START_ADDRESS + 4);
-  __set_MSP(*(__IO uint32_t*) MAIN_PROGRAM_START_ADDRESS);
-  HAL_DeInit();
-  JumpAddress();
-}
-
-void TransmitResponsePacket(uint8_t response)
-{
-  hcan.pTxMsg->StdId = DEVICE_CAN_ID;
-  hcan.pTxMsg->DLC = 1;
-  hcan.pTxMsg->Data[0] = response;
-  HAL_CAN_Transmit_IT(&hcan);
-}
-
-void HAL_CAN_RxCpltCallback(CAN_HandleTypeDef* CanHandle)
-{
-//  // Skip messages not intended for our device
-//  if (CanHandle->pRxMsg->StdId != DEVICE_CAN_ID) {
-//    HAL_CAN_Receive_IT(&hcan, CAN_FIFO0);
-//    return;
-//  }
-
-  if (blState == PAGE_PROG)
-  {
-	  micro_memcpy(&PageBuffer[PageBufferPtr],
-      CanHandle->pRxMsg->Data,
-      CanHandle->pRxMsg->DLC);
-    PageBufferPtr += CanHandle->pRxMsg->DLC;
-
-    if (PageBufferPtr == FLASH_PAGE_SIZE) {
-      HAL_NVIC_DisableIRQ(USB_LP_CAN_RX0_IRQn);
-      HAL_NVIC_DisableIRQ(CAN_RX1_IRQn);
-
-      HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_5);
-      uint32_t crc = HAL_CRC_Calculate(&hcrc, (uint32_t*)PageBuffer, FLASH_PAGE_SIZE / 4);
-
-      if (crc == PageCRC && PageIndex <= NUM_OF_PAGES)
-      {
-        HAL_FLASH_Unlock();
-
-        uint32_t PageError = 0;
-
-        eraseInitStruct.TypeErase = TYPEERASE_PAGES;
-        eraseInitStruct.PageAddress = MAIN_PROGRAM_START_ADDRESS + PageIndex * FLASH_PAGE_SIZE;
-        eraseInitStruct.NbPages = 1;
-
-        HAL_FLASHEx_Erase(&eraseInitStruct, &PageError);
-
-        for (int i = 0; i < FLASH_PAGE_SIZE; i += 4)
-        {
-          HAL_FLASH_Program(TYPEPROGRAM_WORD, MAIN_PROGRAM_START_ADDRESS + PageIndex * FLASH_PAGE_SIZE + i, *(uint32_t*)&PageBuffer[i]);
-        }
-
-        HAL_FLASH_Lock();
-
-        TransmitResponsePacket(CAN_RESP_OK);
-      }
-      else
-      {
-        TransmitResponsePacket(CAN_RESP_ERROR);
-      }
-
-      blState = IDLE;
-
-      HAL_NVIC_EnableIRQ(CAN_RX1_IRQn);
-      HAL_NVIC_EnableIRQ(USB_LP_CAN_RX0_IRQn);
-    }
-
-    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_6);
-    HAL_CAN_Receive_IT(&hcan, CAN_FIFO0);
-    return;
-  }
-
-  switch(CanHandle->pRxMsg->Data[0])
-  {
-    case CMD_HOST_INIT:
-      blState = IDLE;
-      TransmitResponsePacket(CAN_RESP_OK);
-      break;
-    case CMD_PAGE_PROG:
-      if (blState == IDLE) {
-
-    	  // Zero page buffer array
-        for(uint32_t i = 0; i<FLASH_PAGE_SIZE; i++)
-        {
-        	PageBuffer[i] = 0;
-        }
-
-        micro_memcpy(&PageCRC, &CanHandle->pRxMsg->Data[2], sizeof(uint32_t));
-        PageIndex = CanHandle->pRxMsg->Data[1];
-        blState = PAGE_PROG;
-        PageBufferPtr = 0;
-      } else {
-        // Should never get here
-      }
-      break;
-    case CMD_BOOT:
-      TransmitResponsePacket(CAN_RESP_OK);
-      JumpToApplication();
-      break;
-    default:
-      break;
-  }
-
-  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_6);
-  HAL_CAN_Receive_IT(&hcan, CAN_FIFO0);
-}
-/* USER CODE END 0 */
 
 int main(void)
 {
-
-	/* MCU Configuration----------------------------------------------------------*/
-
-	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-	HAL_Init();
-
-	/* Configure the system clock */
-	SystemClock_Config();
-
-	/* Initialize all configured peripherals */
+	__hal_init();
+	__clock_init();
 	__can_init();
 	__crc_init();
 
@@ -191,13 +51,14 @@ int main(void)
 	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 
+	// Set receive/transmit buffers and start CAN reception
 	hcan.pTxMsg = &canTxMessage;
 	hcan.pRxMsg = &canRxMessage;
-
 	HAL_CAN_Receive_IT(&hcan, CAN_FIFO0);
 
+
+	// Wait for CAN bootload message
 	for(uint32_t i=0; i<200; i++)
-	//while(1)
 	{
 	  HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_10);
 	  HAL_Delay(100);
@@ -205,78 +66,155 @@ int main(void)
 
 	// Timed out waiting for host
 	if (blState == WAIT_HOST) {
-	JumpToApplication();
+		__jump_to_application();
 	}
 	while (1)
 	{
 	}
 }
 
-void SystemClock_Config(void)
+
+// Initialize system clock
+void __clock_init(void)
 {
+	RCC_OscInitTypeDef RCC_OscInitStruct;
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+	RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+	RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+	RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
+	HAL_RCC_OscConfig(&RCC_OscInitStruct);
 
-  RCC_OscInitTypeDef RCC_OscInitStruct;
-  RCC_ClkInitTypeDef RCC_ClkInitStruct;
+	RCC_ClkInitTypeDef RCC_ClkInitStruct;
+	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+							  |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-    /**Initializes the CPU, AHB and APB busses clocks 
-    */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
-  HAL_RCC_OscConfig(&RCC_OscInitStruct);
+	HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1);
+	HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq()/1000);
 
-    /**Initializes the CPU, AHB and APB busses clocks 
-    */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1);
-
-    /**Configure the Systick interrupt time 
-    */
-  HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq()/1000);
-
-    /**Configure the Systick 
-    */
-  HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
-
-  /* SysTick_IRQn interrupt configuration */
- HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
-
- HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
+	HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
+	HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
+	HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
 }
 
 
+// Callback triggered when a CAN message is received
+void HAL_CAN_RxCpltCallback(CAN_HandleTypeDef* CanHandle)
+{
+	if (blState == PAGE_PROG)
+	{
+		__micro_memcpy(&PageBuffer[PageBufferPtr], CanHandle->pRxMsg->Data, CanHandle->pRxMsg->DLC);
+		PageBufferPtr += CanHandle->pRxMsg->DLC;
+
+		if (PageBufferPtr == FLASH_PAGE_SIZE)
+		{
+			HAL_NVIC_DisableIRQ(USB_LP_CAN_RX0_IRQn);
+			HAL_NVIC_DisableIRQ(CAN_RX1_IRQn);
+
+			uint32_t crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) PageBuffer, FLASH_PAGE_SIZE / 4);
+
+			if (crc == PageCRC && PageIndex <= NUM_OF_PAGES)
+			{
+				HAL_FLASH_Unlock();
+
+				uint32_t PageError = 0;
+
+				eraseInitStruct.TypeErase = TYPEERASE_PAGES;
+				eraseInitStruct.PageAddress = MAIN_PROGRAM_START_ADDRESS + PageIndex * FLASH_PAGE_SIZE;
+				eraseInitStruct.NbPages = 1;
+
+				HAL_FLASHEx_Erase(&eraseInitStruct, &PageError);
+
+				for (int i = 0; i < FLASH_PAGE_SIZE; i += 4)
+				{
+					HAL_FLASH_Program(TYPEPROGRAM_WORD, MAIN_PROGRAM_START_ADDRESS + PageIndex * FLASH_PAGE_SIZE + i, *(uint32_t*) &PageBuffer[i]);
+				}
+
+				HAL_FLASH_Lock();
+
+				__respond(CAN_RESP_OK);
+			}
+
+			else
+			{
+				__respond(CAN_RESP_ERROR);
+			}
+
+			blState = IDLE;
+
+			HAL_NVIC_EnableIRQ(CAN_RX1_IRQn);
+			HAL_NVIC_EnableIRQ(USB_LP_CAN_RX0_IRQn);
+		}
+
+		HAL_CAN_Receive_IT(&hcan, CAN_FIFO0);
+		return;
+	}
+
+	switch (CanHandle->pRxMsg->Data[0])
+	{
+		case CMD_HOST_INIT:
+		{
+			blState = IDLE;
+			__respond(CAN_RESP_OK);
+		} break;
+
+		case CMD_PAGE_PROG:
+		{
+			if (blState == IDLE)
+			{
+				// Zero page buffer array
+				for (uint32_t i = 0; i < FLASH_PAGE_SIZE; i++)
+				{
+					PageBuffer[i] = 0;
+				}
+
+				__micro_memcpy(&PageCRC, &CanHandle->pRxMsg->Data[2], sizeof(uint32_t));
+				PageIndex = CanHandle->pRxMsg->Data[1];
+				blState = PAGE_PROG;
+				PageBufferPtr = 0;
+
+			} else {
+				// Should never get here
+			}
+		} break;
+
+		case CMD_BOOT:
+		{
+			__respond(CAN_RESP_OK);
+			__jump_to_application();
+		} break;
+
+		default:
+			break;
+	}
+
+	HAL_CAN_Receive_IT(&hcan, CAN_FIFO0);
+}
+
+
+// Initialize CRC peripheral
 static void __crc_init(void)
 {
 	__CRC_CLK_ENABLE();
-  hcrc.Instance = CRC;
-  HAL_CRC_Init(&hcrc);
+	hcrc.Instance = CRC;
+	HAL_CRC_Init(&hcrc);
 }
 
 
-
-void micro_memcpy(void *dest, void *src, uint32_t n)
+// Small memcpy implementation to minimize code size
+void __micro_memcpy(void *dest, void *src, uint32_t n)
 {
-   // Typecast src and dest addresses to (char *)
    char *csrc = (char *)src;
    char *cdest = (char *)dest;
-
-   // Copy contents of src[] to dest[]
    for (uint32_t i=0; i<n; i++)
        cdest[i] = csrc[i];
 }
-
-
-
 
 
 // Initialize the CAN bus
@@ -314,7 +252,7 @@ void __can_init(void)
 
 	// Configure filtering
 	CAN_FilterConfTypeDef filter;
-    filter.FilterIdHigh = 1 << 5; // Listen on address 1, win all arbitration
+    filter.FilterIdHigh = CAN_LISTEN_ADDRESS << 5;
     filter.FilterIdLow =  0;
     filter.FilterMaskIdHigh = 0;
     filter.FilterMaskIdLow =  0;
@@ -336,5 +274,21 @@ void __can_init(void)
     HAL_NVIC_EnableIRQ(CAN_RX1_IRQn);
     HAL_NVIC_SetPriority(CAN_SCE_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(CAN_SCE_IRQn);
+}
 
+
+void __jump_to_application()
+{
+	JumpAddress = *(__IO pFunction*)(MAIN_PROGRAM_START_ADDRESS + 4);
+	__set_MSP(*(__IO uint32_t*) MAIN_PROGRAM_START_ADDRESS);
+	HAL_DeInit();
+	JumpAddress();
+}
+
+void __respond(uint8_t response)
+{
+	hcan.pTxMsg->StdId = CAN_TRANSMIT_ADDRESS;
+	hcan.pTxMsg->DLC = 1;
+	hcan.pTxMsg->Data[0] = response;
+	HAL_CAN_Transmit_IT(&hcan);
 }

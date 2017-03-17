@@ -24,7 +24,8 @@ src/main.o: ../src/main.c \
  C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_pwr.h \
  C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_pwr_ex.h \
  C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_tim.h \
- C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_tim_ex.h
+ C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_tim_ex.h \
+ C:\repos\canboot-slat\inc/config.h
 
 C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal.h:
 
@@ -77,3 +78,5 @@ C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_pwr_ex.h:
 C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_tim.h:
 
 C:\repos\canboot-slat\drivers\STM32F3xx_HAL_Driver\Inc/stm32f3xx_hal_tim_ex.h:
+
+C:\repos\canboot-slat\inc/config.h:
