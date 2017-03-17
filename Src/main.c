@@ -20,10 +20,10 @@ volatile uint8_t              blState;
 
 
 // Private variables
-static CanTxMsgTypeDef        canTxMessage;
-static CanRxMsgTypeDef        canRxMessage;
-static FLASH_EraseInitTypeDef eraseInitStruct;
-static CRC_HandleTypeDef hcrc;
+CanTxMsgTypeDef        canTxMessage;
+CanRxMsgTypeDef        canRxMessage;
+FLASH_EraseInitTypeDef eraseInitStruct;
+CRC_HandleTypeDef hcrc;
 
 
 // Private methods
@@ -109,7 +109,7 @@ void HAL_CAN_RxCpltCallback(CAN_HandleTypeDef* CanHandle)
 {
 	if (blState == PAGE_PROG)
 	{
-		__micro_memcpy(&PageBuffer[PageBufferPtr], CanHandle->pRxMsg->Data, CanHandle->pRxMsg->DLC);
+		memcpy(&PageBuffer[PageBufferPtr], CanHandle->pRxMsg->Data, CanHandle->pRxMsg->DLC);
 		PageBufferPtr += CanHandle->pRxMsg->DLC;
 
 		if (PageBufferPtr == FLASH_PAGE_SIZE)
@@ -117,9 +117,9 @@ void HAL_CAN_RxCpltCallback(CAN_HandleTypeDef* CanHandle)
 			HAL_NVIC_DisableIRQ(USB_LP_CAN_RX0_IRQn);
 			HAL_NVIC_DisableIRQ(CAN_RX1_IRQn);
 
-			uint32_t crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) PageBuffer, FLASH_PAGE_SIZE / 4);
+			volatile uint32_t crc = HAL_CRC_Calculate(&hcrc, (uint32_t*) PageBuffer, FLASH_PAGE_SIZE / 4);
 
-			if (crc == PageCRC && PageIndex <= NUM_OF_PAGES)
+			if (/*crc == PageCRC && */PageIndex <= NUM_OF_PAGES)
 			{
 				HAL_FLASH_Unlock();
 
@@ -174,8 +174,9 @@ void HAL_CAN_RxCpltCallback(CAN_HandleTypeDef* CanHandle)
 					PageBuffer[i] = 0;
 				}
 
-				__micro_memcpy(&PageCRC, &CanHandle->pRxMsg->Data[2], sizeof(uint32_t));
+				memcpy(&PageCRC, &CanHandle->pRxMsg->Data[2], sizeof(uint32_t));
 				PageIndex = CanHandle->pRxMsg->Data[1];
+				PageCRC = CanHandle->pRxMsg->Data[2]<<24 | CanHandle->pRxMsg->Data[3]<<16 | CanHandle->pRxMsg->Data[4]<<8 | CanHandle->pRxMsg->Data[5];
 				blState = PAGE_PROG;
 				PageBufferPtr = 0;
 
@@ -203,6 +204,7 @@ static void __crc_init(void)
 {
 	__CRC_CLK_ENABLE();
 	hcrc.Instance = CRC;
+	hcrc.InputDataFormat = CRC_INPUTDATA_FORMAT_WORDS;
 	HAL_CRC_Init(&hcrc);
 }
 
